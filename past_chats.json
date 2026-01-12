@@ -1,0 +1,9 @@
+[
+  { "text": "Hey! Sorry I missed your call, was in a meeting. Call you in 10?", "tag": "professional" },
+  { "text": "Yo where are you?? We're waiting!", "tag": "casual" },
+  { "text": "Totally agree. Let's circle back on this Monday.", "tag": "professional" },
+  { "text": "Lmao no way 🤣 that's crazy", "tag": "casual" },
+  { "text": "I'll send the docs over by EOD.", "tag": "professional" },
+  { "text": "Nah I'm too tired today, maybe tomorrow?", "tag": "casual" },
+  { "text": "Sounds good to me, thanks for the update.", "tag": "neutral" }
+]
