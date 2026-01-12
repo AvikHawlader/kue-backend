@@ -3,29 +3,34 @@ import json
 import chromadb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
 from contextlib import asynccontextmanager
 
-# --- CONFIGURATION ---
-# We use an environment variable for security. 
-# On your laptop, you can hardcode it for testing, but NEVER commit it to GitHub.
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
+# --- 1. SETUP & MOCK MODE DETECTION ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-chroma_client = chromadb.Client() # In-memory mode for Render Free Tier compatibility
+# Check if we are in "Real" mode or "Free/Mock" mode
+if OPENAI_API_KEY:
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    print("✅ OpenAI Key found. Running in LIVE mode.")
+    USE_MOCK_AI = False
+else:
+    client = None
+    print("⚠️ No OpenAI Key found. Running in MOCK mode (Free).")
+    USE_MOCK_AI = True
+
+# Database Setup
+chroma_client = chromadb.Client()
 collection = chroma_client.get_or_create_collection(name="user_style")
 
-# --- DATA LOADING (Runs on Startup) ---
+# --- 2. DATA LOADING ---
 def load_memory():
-    """Reads JSON and re-teaches the AI your style on startup."""
     if not os.path.exists("past_chats.json"):
-        print("⚠️ Warning: past_chats.json not found. AI will be generic.")
         return
 
     with open("past_chats.json", "r") as f:
         chats = json.load(f)
     
-    # Check if data exists to avoid empty errors
     if not chats:
         return
 
@@ -33,7 +38,6 @@ def load_memory():
     ids = [str(i) for i in range(len(chats))]
     metadatas = [{"tag": msg.get("tag", "general")} for msg in chats]
 
-    # Clear old data to prevent duplicates on restart
     try:
         existing_ids = collection.get()['ids']
         if existing_ids:
@@ -44,58 +48,52 @@ def load_memory():
     collection.add(documents=documents, metadatas=metadatas, ids=ids)
     print(f"✅ Loaded {len(chats)} messages into memory.")
 
-# --- LIFESPAN MANAGER (FastAPI specific) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_memory() # Run this when server starts
+    load_memory()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# --- DATA MODELS ---
 class ReplyRequest(BaseModel):
     incoming_text: str
     sender_name: str
-    relationship: str # e.g., "Boss", "Girlfriend", "Mom"
+    relationship: str 
 
-# --- THE ENDPOINT ---
+# --- 3. THE ENDPOINT ---
 @app.post("/generate")
 def generate_replies(request: ReplyRequest):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API Key is missing on server.")
+    
+    # --- BRANCH A: NO MONEY (MOCK MODE) ---
+    if USE_MOCK_AI:
+        return {
+            "replies": (
+                "1. Neutral: [MOCK] Hey, got your message. (Real AI is off)\n"
+                "2. Friendly: [MOCK] This is a test reply! 😉\n"
+                "3. Direct: [MOCK] Please add API Key to make me real."
+            ),
+            "status": "mock_mode"
+        }
 
-    # 1. RETRIEVE style examples
-    results = collection.query(
-        query_texts=[request.incoming_text], 
-        n_results=3
-    )
-    
-    # Flatten the list of lists
-    retrieved_docs = results['documents'][0] if results['documents'] else []
-    style_context = "\n".join([f"- {doc}" for doc in retrieved_docs])
-
-    # 2. CONSTRUCT PROMPT
-    system_prompt = f"""
-    You are a personal communication assistant acting as the user.
-    
-    YOUR GOAL:
-    Generate 3 distinct replies to the incoming message.
-    
-    CRITICAL STYLE INSTRUCTIONS:
-    - Mimic the tone, capitalization, and emoji usage of the 'USER PAST MESSAGES' below.
-    - If the past messages are short/lowercase, be short/lowercase.
-    
-    USER PAST MESSAGES (STYLE REFERENCE):
-    {style_context}
-    
-    CONTEXT:
-    - Message from: {request.sender_name} ({request.relationship})
-    """
-
-    user_prompt = f"Incoming Message: '{request.incoming_text}'\n\nGenerate 3 options: [Neutral, Friendly, Direct/Witty]"
-
-    # 3. CALL OPENAI (GPT-4o-mini)
+    # --- BRANCH B: REAL AI (ONLY RUNS IF YOU PAID) ---
     try:
+        # 1. Retrieve Style
+        results = collection.query(
+            query_texts=[request.incoming_text], 
+            n_results=3
+        )
+        retrieved_docs = results['documents'][0] if results['documents'] else []
+        style_context = "\n".join([f"- {doc}" for doc in retrieved_docs])
+
+        # 2. Prompt
+        system_prompt = f"""
+        You are acting as the user '{request.sender_name}'.
+        Mimic this style:
+        {style_context}
+        """
+        
+        user_prompt = f"Incoming: '{request.incoming_text}'. Generate 3 replies."
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -104,13 +102,13 @@ def generate_replies(request: ReplyRequest):
             ],
             temperature=0.7
         )
-        generated_text = response.choices[0].message.content
-        return {"replies": generated_text}
+        return {"replies": response.choices[0].message.content, "status": "real_ai"}
     
     except Exception as e:
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- HEALTH CHECK ---
 @app.get("/")
 def home():
-    return {"status": "Kue Backend is Running", "model": "gpt-4o-mini"}
+    mode = "MOCK (Free)" if USE_MOCK_AI else "LIVE (Paid)"
+    return {"status": "Kue Backend is Running", "mode": mode}
