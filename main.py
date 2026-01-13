@@ -2,7 +2,7 @@ import os
 import json
 import chromadb
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # <--- IMPORT THIS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -21,9 +21,7 @@ else:
     print("⚠️ SYSTEM: MOCK MODE (Demo Data Active)")
 
 # --- CHROMADB SETUP ---
-# Note: On Render (free tier), this DB resets on restart. 
-# For persistence, you need a persistent disk or a cloud vector DB.
-chroma_client = chromadb.Client() 
+chroma_client = chromadb.Client()
 collection = chroma_client.get_or_create_collection(name="user_style")
 
 # --- 2. DATA MODELS ---
@@ -36,8 +34,10 @@ class Dossier(BaseModel):
 class RequestPayload(BaseModel):
     incoming_text: str
     dossier: Dossier
+    # NEW: Sliders instead of just "Vibe"
+    interest_score: int = 50   # 0 to 100
+    spice_score: int = 50      # 0 to 100 (or Assertiveness for work)
     custom_input: Optional[str] = None 
-    previous_rejects: List[str] = [] 
 
 # --- 3. LIFESPAN & APP ---
 @asynccontextmanager
@@ -46,11 +46,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# --- ⚠️ CRITICAL FIX: CORS MIDDLEWARE ⚠️ ---
-# This allows your React app to talk to this Python server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (Change this to your frontend URL in production)
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,10 +65,10 @@ def run_mastermind(request: RequestPayload):
 
     # --- B. LIVE MODE ---
     try:
-        # 1. Retrieve Style Context (ChromaDB)
+        # 1. Memory Retrieval (ChromaDB)
         results = collection.query(query_texts=[request.incoming_text], n_results=3)
         style_docs = results['documents'][0] if results['documents'] else []
-        style_context = "\n".join([f"- {s}" for s in style_docs]) if style_docs else "(No past samples, use standard tone)"
+        style_context = "\n".join([f"- {s}" for s in style_docs]) if style_docs else "(No past samples found)"
 
         # 2. Build Strategy
         system_instruction = build_system_prompt(request, style_context)
@@ -80,7 +78,7 @@ def run_mastermind(request: RequestPayload):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"Incoming Message: \"{request.incoming_text}\"\n\nAnalyze and Generate."}
+                {"role": "user", "content": f"Incoming Message: \"{request.incoming_text}\"\n\nDecode and Generate."}
             ],
             response_format={ "type": "json_object" }, 
             temperature=0.7 
@@ -93,85 +91,82 @@ def run_mastermind(request: RequestPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- 5. PROMPT ENGINEERING ---
+# --- 5. PROMPT ENGINEERING (The Logic Core) ---
 
 def build_system_prompt(req: RequestPayload, style_data: str):
     category = req.dossier.category
+    i_score = req.interest_score
+    s_score = req.spice_score
     
-    # 5a. Define Persona
+    # 5a. Define Persona & Slider Meaning
     if category == "Work":
-        persona = "You are a Strategic Corporate Communication Expert."
-        neg_definition = "Firm Refusal / Setting Boundaries"
-        pos_definition = "Agreement / Action-Oriented"
+        persona = "You are a Corporate Strategist. Safety Rails: ON (No emojis, no slang)."
+        slider_context = f"Professionalism Level: {i_score}%, Assertiveness Level: {s_score}%"
+        neg_definition = "Polite but Firm Refusal"
+        pos_definition = "Agreement with Action Items"
     elif category == "Dating":
-        persona = "You are a High-EQ Dating Coach."
-        neg_definition = "Disinterest / Sassy"
-        pos_definition = "Warmth / Flirting"
+        persona = "You are a High-EQ Dating Coach. Safety Rails: OFF."
+        slider_context = f"Interest Level: {i_score}% (Simp vs Cool), Spice Level: {s_score}% (Flirty/Risk)"
+        neg_definition = "Playful Disinterest / Sassy"
+        pos_definition = "High Enthusiasm / Flirting"
     else:
-        persona = "You are a witty friend."
-        neg_definition = "Disagreement / Roast"
-        pos_definition = "Hype / Love"
+        persona = "You are a Witty Friend."
+        slider_context = f"Warmth: {i_score}%, Roast Level: {s_score}%"
+        neg_definition = "Roast / Disagreement"
+        pos_definition = "Hype / Validation"
 
-    # 5b. Define Generation Logic
+    # 5b. Define Generation Task
     if req.custom_input:
         generation_task = f"""
         USER CUSTOM REQUEST: "{req.custom_input}"
-        Generate 3 variations of this specific custom request.
+        Apply the sliders ({slider_context}) to this request.
+        Generate 3 variations.
         keys: ["option_1", "option_2", "option_3"]
         """
     else:
         generation_task = f"""
-        Generate 3 Distinct Sentiment Options:
+        Generate 3 Distinct Options based on ({slider_context}):
         1. "positive": {pos_definition}
-        2. "neutral": Safe / Non-committal
+        2. "neutral": Safe / Buying Time
         3. "negative": {neg_definition}
         """
 
+    # 5c. The Master Prompt
     return f"""
     ROLE: {persona}
+    CONTEXT: {slider_context}
     
-    INPUT CONTEXT:
+    INPUT DATA:
     - User is replying to: {req.dossier.name} ({req.dossier.role_title})
-    - User's Style Samples (from Vector DB):
+    - Memory (Style Samples):
     {style_data}
     
     YOUR TASK (Output JSON Only):
-    1. "analysis": Decode the incoming message (translation, threat_level, strategy_advice).
+    
+    1. "analysis": Perform cognitive analysis.
+       - "translation": What they ACTUALLY mean (Subtext).
+       - "threat_level": Integer 0-100.
+       - "strategy_advice": 1 sentence strategic tip.
+       
     2. "replies": {generation_task}
     """
 
 # --- 6. MOCK DATA ---
 def generate_mock_response(req: RequestPayload):
-    category = req.dossier.category
-    if req.custom_input:
-        return {
-            "analysis": {"translation": "Custom Mode", "strategy_advice": "Executing command."},
-            "replies": {
-                "option_1": f"Custom: {req.custom_input}",
-                "option_2": f"Variation: {req.custom_input}",
-                "option_3": f"Short: {req.custom_input}"
-            }
-        }
-    
-    # Standard Mock
-    replies = {
-        "positive": "Sounds good!",
-        "neutral": "I'll let you know.",
-        "negative": "No thanks."
-    }
-    if category == "Work":
-        replies = {
-            "positive": "I will handle this immediately.",
-            "neutral": "Received, reviewing now.",
-            "negative": "My bandwidth is full."
-        }
-    
     return {
-        "analysis": {"translation": "Mock Logic", "strategy_advice": "This is a demo response."},
-        "replies": replies
+        "analysis": {
+            "translation": "Mock Mode: They want attention.", 
+            "threat_level": 45, 
+            "strategy_advice": "Keep it cool."
+        },
+        "replies": {
+            "positive": f"Sure thing! (Interest: {req.interest_score}%)",
+            "neutral": "Maybe later.",
+            "negative": f"No thanks. (Spice: {req.spice_score}%)"
+        }
     }
 
 # --- 7. HEALTH CHECK ---
 @app.get("/")
 def home():
-    return {"status": "Kue Mastermind Ready", "mode": "MOCK" if USE_MOCK_AI else "LIVE"}
+    return {"status": "Kue Brain v2 Ready", "mode": "MOCK" if USE_MOCK_AI else "LIVE"}
