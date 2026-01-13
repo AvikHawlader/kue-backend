@@ -2,113 +2,176 @@ import os
 import json
 import chromadb
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware  # <--- IMPORT THIS
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
-# --- 1. SETUP & MOCK MODE DETECTION ---
+# --- 1. CONFIGURATION ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Check if we are in "Real" mode or "Free/Mock" mode
 if OPENAI_API_KEY:
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
-    print("✅ OpenAI Key found. Running in LIVE mode.")
     USE_MOCK_AI = False
+    print("🚀 SYSTEM: LIVE MODE (Real AI Active)")
 else:
     client = None
-    print("⚠️ No OpenAI Key found. Running in MOCK mode (Free).")
     USE_MOCK_AI = True
+    print("⚠️ SYSTEM: MOCK MODE (Demo Data Active)")
 
-# Database Setup
-chroma_client = chromadb.Client()
+# --- CHROMADB SETUP ---
+# Note: On Render (free tier), this DB resets on restart. 
+# For persistence, you need a persistent disk or a cloud vector DB.
+chroma_client = chromadb.Client() 
 collection = chroma_client.get_or_create_collection(name="user_style")
 
-# --- 2. DATA LOADING ---
-def load_memory():
-    if not os.path.exists("past_chats.json"):
-        return
+# --- 2. DATA MODELS ---
+class Dossier(BaseModel):
+    name: str  
+    category: str = Field(..., description="Options: 'Work', 'Dating', 'Friends', 'Family'") 
+    role_title: str 
+    archetype: Optional[str] = "Standard" 
 
-    with open("past_chats.json", "r") as f:
-        chats = json.load(f)
-    
-    if not chats:
-        return
+class RequestPayload(BaseModel):
+    incoming_text: str
+    dossier: Dossier
+    custom_input: Optional[str] = None 
+    previous_rejects: List[str] = [] 
 
-    documents = [msg["text"] for msg in chats]
-    ids = [str(i) for i in range(len(chats))]
-    metadatas = [{"tag": msg.get("tag", "general")} for msg in chats]
-
-    try:
-        existing_ids = collection.get()['ids']
-        if existing_ids:
-            collection.delete(ids=existing_ids)
-    except:
-        pass
-
-    collection.add(documents=documents, metadatas=metadatas, ids=ids)
-    print(f"✅ Loaded {len(chats)} messages into memory.")
-
+# --- 3. LIFESPAN & APP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_memory()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-class ReplyRequest(BaseModel):
-    incoming_text: str
-    sender_name: str
-    relationship: str 
+# --- ⚠️ CRITICAL FIX: CORS MIDDLEWARE ⚠️ ---
+# This allows your React app to talk to this Python server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (Change this to your frontend URL in production)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- 3. THE ENDPOINT ---
-@app.post("/generate")
-def generate_replies(request: ReplyRequest):
+# --- 4. THE MASTERMIND ENGINE ---
+
+@app.post("/mastermind")
+def run_mastermind(request: RequestPayload):
     
-    # --- BRANCH A: NO MONEY (MOCK MODE) ---
+    # --- A. MOCK MODE ---
     if USE_MOCK_AI:
-        return {
-            "replies": (
-                "1. Neutral: [MOCK] Hey, got your message. (Real AI is off)\n"
-                "2. Friendly: [MOCK] This is a test reply! 😉\n"
-                "3. Direct: [MOCK] Please add API Key to make me real."
-            ),
-            "status": "mock_mode"
-        }
+        return generate_mock_response(request)
 
-    # --- BRANCH B: REAL AI (ONLY RUNS IF YOU PAID) ---
+    # --- B. LIVE MODE ---
     try:
-        # 1. Retrieve Style
-        results = collection.query(
-            query_texts=[request.incoming_text], 
-            n_results=3
-        )
-        retrieved_docs = results['documents'][0] if results['documents'] else []
-        style_context = "\n".join([f"- {doc}" for doc in retrieved_docs])
+        # 1. Retrieve Style Context (ChromaDB)
+        results = collection.query(query_texts=[request.incoming_text], n_results=3)
+        style_docs = results['documents'][0] if results['documents'] else []
+        style_context = "\n".join([f"- {s}" for s in style_docs]) if style_docs else "(No past samples, use standard tone)"
 
-        # 2. Prompt
-        system_prompt = f"""
-        You are acting as the user '{request.sender_name}'.
-        Mimic this style:
-        {style_context}
-        """
+        # 2. Build Strategy
+        system_instruction = build_system_prompt(request, style_context)
         
-        user_prompt = f"Incoming: '{request.incoming_text}'. Generate 3 replies."
-
+        # 3. Call OpenAI
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"Incoming Message: \"{request.incoming_text}\"\n\nAnalyze and Generate."}
             ],
-            temperature=0.7
+            response_format={ "type": "json_object" }, 
+            temperature=0.7 
         )
-        return {"replies": response.choices[0].message.content, "status": "real_ai"}
-    
+        
+        return json.loads(response.choices[0].message.content)
+
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- 5. PROMPT ENGINEERING ---
+
+def build_system_prompt(req: RequestPayload, style_data: str):
+    category = req.dossier.category
+    
+    # 5a. Define Persona
+    if category == "Work":
+        persona = "You are a Strategic Corporate Communication Expert."
+        neg_definition = "Firm Refusal / Setting Boundaries"
+        pos_definition = "Agreement / Action-Oriented"
+    elif category == "Dating":
+        persona = "You are a High-EQ Dating Coach."
+        neg_definition = "Disinterest / Sassy"
+        pos_definition = "Warmth / Flirting"
+    else:
+        persona = "You are a witty friend."
+        neg_definition = "Disagreement / Roast"
+        pos_definition = "Hype / Love"
+
+    # 5b. Define Generation Logic
+    if req.custom_input:
+        generation_task = f"""
+        USER CUSTOM REQUEST: "{req.custom_input}"
+        Generate 3 variations of this specific custom request.
+        keys: ["option_1", "option_2", "option_3"]
+        """
+    else:
+        generation_task = f"""
+        Generate 3 Distinct Sentiment Options:
+        1. "positive": {pos_definition}
+        2. "neutral": Safe / Non-committal
+        3. "negative": {neg_definition}
+        """
+
+    return f"""
+    ROLE: {persona}
+    
+    INPUT CONTEXT:
+    - User is replying to: {req.dossier.name} ({req.dossier.role_title})
+    - User's Style Samples (from Vector DB):
+    {style_data}
+    
+    YOUR TASK (Output JSON Only):
+    1. "analysis": Decode the incoming message (translation, threat_level, strategy_advice).
+    2. "replies": {generation_task}
+    """
+
+# --- 6. MOCK DATA ---
+def generate_mock_response(req: RequestPayload):
+    category = req.dossier.category
+    if req.custom_input:
+        return {
+            "analysis": {"translation": "Custom Mode", "strategy_advice": "Executing command."},
+            "replies": {
+                "option_1": f"Custom: {req.custom_input}",
+                "option_2": f"Variation: {req.custom_input}",
+                "option_3": f"Short: {req.custom_input}"
+            }
+        }
+    
+    # Standard Mock
+    replies = {
+        "positive": "Sounds good!",
+        "neutral": "I'll let you know.",
+        "negative": "No thanks."
+    }
+    if category == "Work":
+        replies = {
+            "positive": "I will handle this immediately.",
+            "neutral": "Received, reviewing now.",
+            "negative": "My bandwidth is full."
+        }
+    
+    return {
+        "analysis": {"translation": "Mock Logic", "strategy_advice": "This is a demo response."},
+        "replies": replies
+    }
+
+# --- 7. HEALTH CHECK ---
 @app.get("/")
 def home():
-    mode = "MOCK (Free)" if USE_MOCK_AI else "LIVE (Paid)"
-    return {"status": "Kue Backend is Running", "mode": mode}
+    return {"status": "Kue Mastermind Ready", "mode": "MOCK" if USE_MOCK_AI else "LIVE"}
